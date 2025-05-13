@@ -13,6 +13,10 @@ pydantic_form = st._gather_metrics("pydantic_form", _pydantic_form)
 from .ui_renderer import pydantic_input as _pydantic_input
 
 pydantic_input = st._gather_metrics("pydantic_input", _pydantic_input)
+from .ui_renderer import pydantic_nested_input as _pydantic_nested_input
+
+pydantic_nested_input = st._gather_metrics("pydantic_nested_input", _pydantic_nested_input)
+
 from .ui_renderer import pydantic_output as _pydantic_output
 
 pydantic_output = st._gather_metrics("pydantic_output", _pydantic_output)

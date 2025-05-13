@@ -7,13 +7,14 @@ import json
 import mimetypes
 import re
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union, get_args, get_origin
 
 import pandas as pd
 import streamlit as st
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from pydantic import dataclasses as pydantic_dataclasses
 from pydantic_extra_types.color import Color
+from pydantic.fields import FieldInfo
 
 from streamlit_pydantic import schema_utils
 
@@ -88,163 +89,171 @@ class InputUI:
     def __init__(
         self,
         key: str,
-        model: Type[BaseModel],
+        model: Union[Type[BaseModel], BaseModel],
         streamlit_container: Any = st,
         group_optional_fields: GroupOptionalFieldsStrategy = "no",  # type: ignore
         lowercase_labels: bool = False,
         ignore_empty_values: bool = False,
         return_model: bool = False,
+        _editing_stack_key: Optional[str] = None, 
+        _current_instance_data: Optional[Dict] = None,
+        _is_sub_form: bool = False,
+        render_nested_buttons: bool = False
     ):
         self._key = key
         self._return_model = return_model
+        self._streamlit_container = streamlit_container
+        self._lowercase_labels = lowercase_labels
+        self._group_optional_fields = group_optional_fields
+        self._ignore_empty_values = ignore_empty_values
+        self._is_sub_form = _is_sub_form
+        self._render_nested_buttons = render_nested_buttons
 
         self._session_state = st.session_state
 
-        # Initialize Sessions State
-        if "run_id" not in st.session_state:
-            self._session_state.run_id = 0
+        # Editing stack management (shared across related form instances)
+        self._editing_stack_session_key = _editing_stack_key or f"{self._key}-pydantic-editing-stack"
+        if self._editing_stack_session_key not in self._session_state:
+            self._session_state[self._editing_stack_session_key] = []
 
-        self._session_input_key = self._key + "-data"
-        if self._session_input_key not in st.session_state:
-            self._session_state[self._session_input_key] = {}
+        # Data management for the current form level
+        self._session_input_key = self._key + "-data" # Unique data store for this form/sub-form level
 
-        self._lowercase_labels = lowercase_labels
-        self._group_optional_fields = group_optional_fields
-        self._streamlit_container = streamlit_container
-        self._ignore_empty_values = ignore_empty_values
+        initial_data_to_use = _current_instance_data
 
-        if dataclasses.is_dataclass(model):
+        if isinstance(model, BaseModel):
+            self._input_class = model.__class__
+            self._type_adapter = TypeAdapter(self._input_class) if not dataclasses.is_dataclass(self._input_class) else TypeAdapter(pydantic_dataclasses.dataclass(self._input_class))
+            self._input_schema = self._type_adapter.json_schema(by_alias=True)
+            if initial_data_to_use is None: # Only use model's data if no explicit override
+                initial_data_to_use = model.model_dump()
+        elif dataclasses.is_dataclass(model) and not isinstance(model, type): # Dataclass instance
+            self._input_class = model.__class__ # Get class from instance
+            self._type_adapter = TypeAdapter(pydantic_dataclasses.dataclass(self._input_class))
+            self._input_schema = self._type_adapter.json_schema(by_alias=True)
+            if initial_data_to_use is None:
+                 initial_data_to_use = dataclasses.asdict(model)
+        elif dataclasses.is_dataclass(model) and isinstance(model, type): # Dataclass type
             self._input_class = model
-            if isinstance(model, type):
-                self._type_adapter = TypeAdapter(pydantic_dataclasses.dataclass(model))
-            else:
-                self._type_adapter = TypeAdapter(
-                    pydantic_dataclasses.dataclass(model.__class__)
-                )
-            self._input_schema = self._type_adapter.json_schema()
+            self._type_adapter = TypeAdapter(pydantic_dataclasses.dataclass(self._input_class))
+            self._input_schema = self._type_adapter.json_schema(by_alias=True)
+            if initial_data_to_use is None:
+                # For a new form from Type, initialize with defaults
+                # Pydantic models handle defaults upon instantiation.
+                # For dataclasses, default_factory is used.
+                # We will initialize session state with an empty dict, and Pydantic validation will apply defaults.
+                initial_data_to_use = {} # Let Pydantic handle defaults on validation / model creation from this
+        elif inspect.isclass(model) and issubclass(model, BaseModel): # Pydantic Model Type
+            self._input_class = model
+            self._type_adapter = TypeAdapter(self._input_class)
+            self._input_schema = self._input_class.model_json_schema(by_alias=True)
+            if initial_data_to_use is None:
+                initial_data_to_use = {} # Let Pydantic handle defaults
         else:
-            self._type_adapter = None
-            self._input_schema = model.model_json_schema(by_alias=True)
-            self._input_class = model
+            raise ValueError(f"Unsupported model type: {type(model)}. Must be BaseModel or dataclass (type or instance).")
+
+        if self._session_input_key not in self._session_state or initial_data_to_use is not None:
+             # If explicit data is given, or no session data exists, set it.
+             # This ensures sub-forms start with the correct slice of data.
+             self._session_state[self._session_input_key] = initial_data_to_use if initial_data_to_use is not None else {}
+
 
         self._schema_properties = self._input_schema.get("properties", {})
         self._schema_references = self._input_schema.get("$defs", {})
-        self._schema_required = self._input_schema.get("required", {})
+        self._schema_required = self._input_schema.get("required", [])
 
-    def render_ui(self) -> Dict:
-        if _has_input_ui_renderer(self._input_class):
-            # The input model has a rendering function
-            # The rendering also returns the current state of input data
-            self._session_state[self._session_input_key] = (
-                self._input_class.render_input_ui(  # type: ignore
-                    self._streamlit_container,
-                    self._session_state[self._session_input_key],
-                ).model_dump()
-            )
-            return self._session_state[self._session_input_key]
+
+    def _get_editing_stack(self) -> List[Dict[str, Any]]:
+        return self._session_state.get(self._editing_stack_session_key, [])
+
+    def _push_editing_context(self, property_attribute_name: str, nested_model_class: Type[BaseModel], is_new: bool):
+        stack = self._get_editing_stack()
+        # property_schema is not strictly needed if we have the class
+        stack.append({
+            "parent_form_key": self._key, 
+            "parent_session_data_key": self._session_input_key, 
+            "property_attribute_name": property_attribute_name, 
+            "nested_model_class": nested_model_class, 
+            "is_new": is_new,
+        })
+        # Force rerun after context push to ensure pydantic_form re-evaluates
+        st.rerun()
+
+
+    def render_ui(self) -> Dict: # Always returns dict of current values for this level
+        # This method now just renders its own level. Orchestration is in pydantic_form.
+        # Initialize Sessions State for run_id (if not already done globally, though it was in original init)
+        if "run_id" not in st.session_state: # Should be handled by top-level form init
+            self._session_state.run_id = 0
+        
+        # Ensure current form's data store is initialized if somehow missed
+        if self._session_input_key not in self._session_state :
+            self._session_state[self._session_input_key] = self._input_class().model_dump() if issubclass(self._input_class, BaseModel) else dataclasses.asdict(self._input_class())
+
 
         properties_in_expander = []
 
-        # check if the input_class is an instance and build value dicts
-        if isinstance(self._input_class, BaseModel):
-            instance_dict = self._input_class.model_dump()
-            instance_dict_by_alias = self._input_class.model_dump(by_alias=True)
-        elif isinstance(self._input_class.__class__, type):  # for dataclasses
-            instance_dict = dict(self._input_class.__dict__)
-            instance_dict_by_alias = None
-        else:
-            instance_dict = None
-            instance_dict_by_alias = None
+        # The instance_dict for pre-filling values comes from self._session_state[self._session_input_key]
+        # This is populated by __init__ or subsequent edits.
+        instance_dict = self._session_state.get(self._session_input_key, {})
+        # by_alias version is not directly available here, rely on schema keys (which are by_alias if schema was generated that way)
 
         for property_key in self._schema_properties.keys():
             streamlit_app = self._streamlit_container
-            if property_key not in self._schema_required:
+            is_optional_field = property_key not in self._schema_required
+
+            if is_optional_field:
                 if self._group_optional_fields == "sidebar":
                     streamlit_app = self._streamlit_container.sidebar
                 elif self._group_optional_fields == "expander":
                     properties_in_expander.append(property_key)
-                    # Render properties later in expander (see below)
                     continue
 
-            property = self._schema_properties[property_key]
+            property_schema = self._schema_properties[property_key]
 
-            if not property.get("title"):
-                # Set property key as fallback title
-                property["title"] = _name_to_title(property_key)
+            if not property_schema.get("title"):
+                property_schema["title"] = _name_to_title(property_key)
 
-            # if there are instance values, add them to the property dict
-            if instance_dict is not None:
-                instance_value = instance_dict.get(property_key)
-                if instance_value in [None, ""] and instance_dict_by_alias:
-                    instance_value = instance_dict_by_alias.get(property_key)
-                if instance_value not in [None, ""]:
-                    property["init_value"] = instance_value
-                    # keep a reference of the original class to help with non-discriminated unions
-                    # TODO: This will not succeed for attributes that have an alias
-                    attr = getattr(self._input_class, property_key, None)
-                    if attr is not None:
-                        property["instance_class"] = str(type(attr))
-
-            try:
-                value = self._render_property(streamlit_app, property_key, property)
-                if not self._is_value_ignored(property_key, value):
+            # Add current value from session state to property_schema for rendering
+            # The _render_property methods expect "init_value" if available
+            current_value_for_prop = self._get_value(property_key) # Gets from self._session_state[self._session_input_key]
+            if current_value_for_prop is not None:
+                 property_schema["init_value"] = current_value_for_prop
+            
+            # Pass parent_model_class to _render_property for type introspection
+            value = self._render_property(streamlit_app, property_key, property_schema, parent_model_class=self._input_class)
+            
+            if not (value is None and self._is_value_ignored(property_key, value)):
+                 # _render_property for nested models with buttons might return current value without re-storing if no change.
+                 # If it returns a special marker or None when buttons handle it, this logic might need adjustment.
+                 # For now, assume _render_property returns the value to be stored or None.
+                 # The "Remove" button directly calls self._store_value(..., None).
+                 # Create/Edit buttons call _push_editing_context and rerun, so value storage here is for non-nested or display.
+                if not (schema_utils.is_single_object(property_schema, self._schema_references) and \
+                        any(btn_key.startswith(f"{self._key}-{property_key}-create") or btn_key.startswith(f"{self._key}-{property_key}-edit") for btn_key in st.session_state.keys() if isinstance(btn_key, str))):
+                    # Only store if not a nested object for which a button was just pressed (to avoid overwriting during navigation)
+                    # This condition is a bit fragile. A cleaner way is needed.
+                    # For now, let's assume _render_property for nested object returns current data and doesn't rely on this to store it if buttons were involved.
                     self._store_value(property_key, value)
-            except Exception:
-                pass
+
 
         if properties_in_expander:
-            # Render optional properties in expander
-            with self._streamlit_container.expander(
-                "Optional Parameters", expanded=False
-            ):
+            with self._streamlit_container.expander("Optional Parameters", expanded=False):
                 for property_key in properties_in_expander:
-                    property = self._schema_properties[property_key]
+                    property_schema = self._schema_properties[property_key]
+                    if not property_schema.get("title"):
+                        property_schema["title"] = _name_to_title(property_key)
+                    
+                    current_value_for_prop = self._get_value(property_key)
+                    if current_value_for_prop is not None:
+                        property_schema["init_value"] = current_value_for_prop
 
-                    if not property.get("title"):
-                        # Set property key as fallback title
-                        property["title"] = _name_to_title(property_key)
-
-                    try:
-                        value = self._render_property(
-                            self._streamlit_container, property_key, property
-                        )
-
-                        if not self._is_value_ignored(property_key, value):
+                    value = self._render_property(self._streamlit_container, property_key, property_schema, parent_model_class=self._input_class)
+                    if not (value is None and self._is_value_ignored(property_key, value)):
                             self._store_value(property_key, value)
 
-                    except Exception:
-                        pass
-
-        input_state = self._session_state[self._session_input_key]
-
-        if self._return_model:
-            # Validate and return a BaseModel or DataClass instance
-            try:
-                if self._type_adapter is not None:
-                    self._type_adapter.validate_python(input_state)
-                    if isinstance(self._input_class, type):
-                        # DataClass model
-                        return self._input_class(**input_state)  # type: ignore
-                    else:
-                        # DataClass instance
-                        return self._input_class.__class__(**input_state)
-                else:
-                    # BaseModel
-                    return self._input_class.model_validate(input_state)  # type: ignore
-            except ValidationError as ex:
-                error_text = "**Input failed validation:**"
-                for error in ex.errors():
-                    if "loc" in error and "msg" in error:
-                        location = ".".join(error["loc"]).replace("__root__.", "")  # type: ignore
-                        error_msg = f"**{location}:** " + error["msg"]
-                        error_text += "\n\n" + error_msg
-                    else:
-                        # Fallback
-                        error_text += "\n\n" + str(error)
-                st.warning(error_text)
-                return None  # type: ignore
-        else:
-            return input_state
+        # This InputUI always returns the current dict state of its own level
+        return self._session_state[self._session_input_key]
 
     def _get_overwrite_streamlit_kwargs(self, key: str, property: Dict) -> Dict:
         streamlit_kwargs: Dict = {}
@@ -538,18 +547,28 @@ class InputUI:
             )
             select_options = reference_item["enum"]
 
-        if property.get("init_value"):
-            streamlit_kwargs["index"] = select_options.index(
-                property.get("init_value")  # type: ignore
-            )
-        elif property.get("default") is not None:
-            try:
-                streamlit_kwargs["index"] = select_options.index(
-                    property.get("default")  # type: ignore
-                )
-            except Exception:
-                # Use default selection
-                pass
+        init_value_from_model = property.get("init_value")  # This is from the actual model data
+        default_value_from_schema = property.get("default") # This is the default value from the JSON schema
+
+        if init_value_from_model is not None:
+            value_to_match = init_value_from_model
+            # Check if init_value_from_model is an Enum instance or an object with a .value attribute
+            # Ensure it's not a primitive that happens to have a .value attribute (e.g. some custom string/number wrappers)
+            if hasattr(init_value_from_model, 'value') and not isinstance(init_value_from_model, (str, int, float, bool)):
+                value_to_match = init_value_from_model.value
+            
+            if value_to_match in select_options:
+                streamlit_kwargs["index"] = select_options.index(value_to_match)
+            else:
+                # If the init_value (or its .value) is not in the options,
+                # st.selectbox will default to the first item.
+                # This can happen if data is stale or enum definition changed.
+                pass 
+        elif default_value_from_schema is not None:
+            # default_value_from_schema is usually the string/primitive value from the JSON schema
+            if default_value_from_schema in select_options:
+                streamlit_kwargs["index"] = select_options.index(default_value_from_schema)
+            # else: default from schema not in options, let selectbox default to first item.
 
         # if there is only one option then there is no choice for the user to be make
         # so simply return the value (This is relevant for discriminator properties)
@@ -800,7 +819,7 @@ class InputUI:
 
             new_property["readOnly"] = property.get("readOnly", False)
 
-            value = self._render_property(streamlit_app, full_key, new_property)
+            value = self._render_property(streamlit_app, full_key, new_property, parent_model_class=self._input_class)
             if not self._is_value_ignored(property_key, value):
                 object_inputs[property_key] = value
 
@@ -862,7 +881,7 @@ class InputUI:
                         "readOnly": property.get("readOnly"),
                         **property["items"],
                     }
-                    return self._render_property(streamlit_app, new_key, new_property)
+                    return self._render_property(streamlit_app, new_key, new_property, parent_model_class=self._input_class)
 
             else:
                 # when the remove button is clicked clear the placeholder and return None
@@ -914,9 +933,7 @@ class InputUI:
                         **property["additionalProperties"],
                     }
                     with value_col:
-                        updated_value = self._render_property(
-                            streamlit_app, dict_value_key, new_property
-                        )
+                        updated_value = self._render_property(streamlit_app, dict_value_key, new_property, parent_model_class=self._input_class)
 
                     return updated_key, updated_value
 
@@ -1064,57 +1081,140 @@ class InputUI:
 
         return object_list
 
-    def _render_property(self, streamlit_app: Any, key: str, property: Dict) -> Any:
+    def _render_property(self, streamlit_app: Any, key: str, property: Dict, parent_model_class: Type[BaseModel]) -> Any:
         # filter the case of optional and nullable
-        property = schema_utils.filter_nullable(property)
-        if schema_utils.is_single_enum_property(property, self._schema_references):
-            return self._render_single_enum_input(streamlit_app, key, property)
+        property_schema = schema_utils.filter_nullable(property)
 
-        if schema_utils.is_multi_enum_property(property, self._schema_references):
-            return self._render_multi_enum_input(streamlit_app, key, property)
+        # Handle nested Pydantic Models (single objects) with buttons
+        if schema_utils.is_single_object(property_schema, self._schema_references):
+            target_field_info: Optional[FieldInfo] = None
+            target_attr_name: Optional[str] = None
 
-        if schema_utils.is_single_file_property(property):
-            return self._render_single_file_input(streamlit_app, key, property)
+            # Find Pydantic FieldInfo: key is from schema (potentially alias)
+            # Parent_model_class.model_fields is keyed by attribute name.
+            for attr_name_iter, field_info_iter in parent_model_class.model_fields.items():
+                if field_info_iter.alias == key:
+                    target_field_info = field_info_iter
+                    target_attr_name = attr_name_iter
+                    break
+                # Fallback if alias not used in schema key for some reason (should not happen with by_alias=True)
+                if not target_field_info and attr_name_iter == key: # Check if key is already the attribute name
+                     target_field_info = field_info_iter
+                     target_attr_name = attr_name_iter
+            
+            if not target_field_info and key in parent_model_class.model_fields: # Final check if key is attr_name
+                target_attr_name = key
+                target_field_info = parent_model_class.model_fields[key]
 
-        if schema_utils.is_multi_file_property(property):
-            return self._render_multi_file_input(streamlit_app, key, property)
 
-        if schema_utils.is_single_datetime_property(property):
-            return self._render_single_datetime_input(streamlit_app, key, property)
+            nested_model_class: Optional[Type[BaseModel]] = None
+            if target_field_info:
+                actual_type = target_field_info.annotation
+                origin_type = get_origin(actual_type)
+                
+                types_to_check = []
+                if origin_type is Union or str(origin_type) == "typing.Optional" or str(origin_type) == "Optional": # Optional is Union[X, None]
+                    args = get_args(actual_type)
+                    types_to_check.extend([t for t in args if t is not type(None)])
+                elif actual_type is not type(None):
+                    types_to_check.append(actual_type)
 
-        if schema_utils.is_single_color_property(property):
-            return self._render_single_color_input(streamlit_app, key, property)
+                for t in types_to_check:
+                    if inspect.isclass(t) and issubclass(t, BaseModel):
+                        nested_model_class = t
+                        break
+            
+            current_value = self._get_value(key) # Get current data for the nested model field
 
-        if schema_utils.is_single_boolean_property(property):
-            return self._render_single_boolean_input(streamlit_app, key, property)
+            if nested_model_class and target_attr_name:
+                # We have a recognized nested BaseModel field.
+                # Conditionally render buttons or inline form.
+                if self._render_nested_buttons:
+                    field_title = property_schema.get("title", key)
+                    cols = streamlit_app.columns([3,1,1,1]) if current_value is not None and (key not in self._schema_required) else streamlit_app.columns([3,1,1])
+                    with cols[0]:
+                        st.markdown(f"**{field_title}**")
+                        if current_value is not None:
+                            st.json(current_value, expanded=False)
+                        elif key not in self._schema_required:
+                            st.caption("Optional field, not set.")
+                        else:
+                            st.caption("Required field, not set.")
 
-        if schema_utils.is_single_dict_property(property):
-            return self._render_single_dict_input(streamlit_app, key, property)
+                    button_key_base = f"{self._key}-{self._session_state.run_id}-{target_attr_name}"
 
-        if schema_utils.is_single_number_property(property):
-            return self._render_single_number_input(streamlit_app, key, property)
+                    if current_value is None:
+                        if cols[1].button("➕ Create", key=f"{button_key_base}-create", help=f"Create {field_title}"):
+                            self._push_editing_context(target_attr_name, nested_model_class, is_new=True)
+                    else:
+                        if cols[1].button("✏️ Edit", key=f"{button_key_base}-edit", help=f"Edit {field_title}"):
+                            self._push_editing_context(target_attr_name, nested_model_class, is_new=False)
+                    
+                    if current_value is not None and (key not in self._schema_required):
+                        remove_button_col_idx = 2
+                        if cols[remove_button_col_idx].button("➖ Remove", key=f"{button_key_base}-remove", help=f"Remove {field_title}"):
+                            self._store_value(key, None)
+                            st.rerun()
+                    return current_value # Buttons handle navigation
+                else:
+                    # Fallback for pydantic_form: render inline (original behavior)
+                    return self._render_single_object_input(streamlit_app, key, property_schema)
 
-        if schema_utils.is_single_string_property(property):
-            return self._render_single_string_input(streamlit_app, key, property)
+            else: # Not a recognized nested BaseModel or type extraction failed, fallback
+                # Fallback to original rendering for objects if type inspection fails
+                return self._render_single_object_input(streamlit_app, key, property_schema)
 
-        if schema_utils.is_single_object(property, self._schema_references):
-            return self._render_single_object_input(streamlit_app, key, property)
 
-        if schema_utils.is_object_list_property(property, self._schema_references):
-            return self._render_list_input(streamlit_app, key, property)
+        if schema_utils.is_single_enum_property(property_schema, self._schema_references):
+            return self._render_single_enum_input(streamlit_app, key, property_schema)
 
-        if schema_utils.is_property_list(property):
-            return self._render_list_input(streamlit_app, key, property)
+        if schema_utils.is_multi_enum_property(property_schema, self._schema_references):
+            return self._render_multi_enum_input(streamlit_app, key, property_schema)
 
-        if schema_utils.is_single_reference(property):
-            return self._render_single_reference(streamlit_app, key, property)
+        if schema_utils.is_single_file_property(property_schema):
+            return self._render_single_file_input(streamlit_app, key, property_schema)
 
-        if schema_utils.is_union_property(property):
-            return self._render_union_property(streamlit_app, key, property)
+        if schema_utils.is_multi_file_property(property_schema):
+            return self._render_multi_file_input(streamlit_app, key, property_schema)
+
+        if schema_utils.is_single_datetime_property(property_schema):
+            return self._render_single_datetime_input(streamlit_app, key, property_schema)
+
+        if schema_utils.is_single_color_property(property_schema):
+            return self._render_single_color_input(streamlit_app, key, property_schema)
+
+        if schema_utils.is_single_boolean_property(property_schema):
+            return self._render_single_boolean_input(streamlit_app, key, property_schema)
+
+        if schema_utils.is_single_dict_property(property_schema):
+            return self._render_single_dict_input(streamlit_app, key, property_schema)
+
+        if schema_utils.is_single_number_property(property_schema):
+            return self._render_single_number_input(streamlit_app, key, property_schema)
+
+        if schema_utils.is_single_string_property(property_schema):
+            return self._render_single_string_input(streamlit_app, key, property_schema)
+
+        if schema_utils.is_single_object(property_schema, self._schema_references):
+            return self._render_single_object_input(streamlit_app, key, property_schema)
+
+        if schema_utils.is_object_list_property(property_schema, self._schema_references):
+            return self._render_list_input(streamlit_app, key, property_schema)
+
+        if schema_utils.is_property_list(property_schema):
+            return self._render_list_input(streamlit_app, key, property_schema)
+
+        if schema_utils.is_single_reference(property_schema):
+            # This might be another path for nested objects if not caught by is_single_object first.
+            # For now, assume is_single_object with type checking is primary.
+            return self._render_single_reference(streamlit_app, key, property_schema)
+
+        if schema_utils.is_union_property(property_schema):
+            return self._render_union_property(streamlit_app, key, property_schema)
 
         streamlit_app.warning(
             "The type of the following property is currently not supported: "
-            + str(property.get("title"))
+            + str(property_schema.get("title"))
         )
         raise Exception("Unsupported property")
 
@@ -1369,37 +1469,366 @@ def pydantic_form(
     model: Type[T],
     submit_label: str = "Submit",
     clear_on_submit: bool = False,
-    group_optional_fields: GroupOptionalFieldsStrategy = "no",  # type: ignore
+    group_optional_fields: GroupOptionalFieldsStrategy = "no",
     lowercase_labels: bool = False,
     ignore_empty_values: bool = False,
 ) -> Optional[T]:
     """Auto-generates a Streamlit form based on the given (Pydantic-based) input class.
-
-    Args:
-        key (str): A string that identifies the form. Each form must have its own key.
-        model (Type[BaseModel]): The input model. Either a class or instance based on Pydantic `BaseModel` or Python `dataclass`.
-        submit_label (str): A short label explaining to the user what this button is for. Defaults to “Submit”.
-        clear_on_submit (bool): If True, all widgets inside the form will be reset to their default values after the user presses the Submit button. Defaults to False.
-        group_optional_fields (str, optional): If `sidebar`, optional input elements will be rendered on the sidebar.
-            If `expander`,  optional input elements will be rendered inside an expander element. Defaults to `no`.
-        lowercase_labels (bool): If `True`, all input element labels will be lowercased. Defaults to `False`.
-        ignore_empty_values (bool): If `True`, empty values for strings and numbers will not be stored in the session state. Defaults to `False`.
-
-    Returns:
-        Optional[BaseModel]: An instance of the given input class,
-            if the submit button is used and the input data passes the Pydantic validation.
+       Supports nested model editing via a stacked navigation approach.
     """
 
-    with st.form(key=key, clear_on_submit=clear_on_submit):
-        input_state = InputUI(
-            key,
-            model,
+    editing_stack_session_key = f"{key}-pydantic-editing-stack"
+    if editing_stack_session_key not in st.session_state:
+        st.session_state[editing_stack_session_key] = []
+    
+    editing_stack: List[Dict[str, Any]] = st.session_state[editing_stack_session_key]
+
+    current_model_to_render_class: Type[BaseModel] = model
+    current_input_ui_key = key 
+    data_for_current_form: Optional[Dict] = None
+    
+    # Path within the root_data to the current sub-model's data being edited
+    path_to_current_model_in_root_session_data: List[str] = [] 
+    is_sub_form = bool(editing_stack)
+
+    # Initialize root model's data store in session state if it doesn't exist
+    root_model_session_data_key = key + "-data"
+    if root_model_session_data_key not in st.session_state:
+        # Initialize with an empty dict. InputUI will handle rendering fields
+        # and Pydantic defaults from schema will be used for widgets.
+        st.session_state[root_model_session_data_key] = {}
+
+
+    if editing_stack:
+        top_context = editing_stack[-1]
+        current_model_to_render_class = top_context["nested_model_class"]
+        
+        # Create a unique key for the InputUI instance of the sub-form
+        # Path helps ensure uniqueness if same field name appears at different nesting levels
+        temp_path_keys_for_key = []
+        for i_ctx, ctx_item_for_key in enumerate(editing_stack):
+            temp_path_keys_for_key.append(ctx_item_for_key["property_attribute_name"])
+        unique_path_str_for_key = "_".join(temp_path_keys_for_key)
+        current_input_ui_key = f"{key}-edit-{unique_path_str_for_key}-{len(editing_stack)}"
+        
+        # Retrieve the current data for the nested model from the root session data
+        current_parent_data_slice = st.session_state[root_model_session_data_key]
+        
+        for i_ctx, ctx_item in enumerate(editing_stack):
+            attr_name = ctx_item["property_attribute_name"]
+            path_to_current_model_in_root_session_data.append(attr_name)
+            
+            is_target_attribute = (i_ctx == len(editing_stack) - 1)
+
+            if not isinstance(current_parent_data_slice, dict):
+                st.error(f"Data structure error: Expected a dictionary at path leading to '{attr_name}'. Found: {type(current_parent_data_slice)}")
+                valid_path = False
+                break
+
+            if attr_name not in current_parent_data_slice or current_parent_data_slice[attr_name] is None:
+                # Attribute doesn't exist or is None
+                if is_target_attribute: # This is the one we want to edit/create
+                    if top_context["is_new"] or current_parent_data_slice.get(attr_name) is None:
+                        current_parent_data_slice[attr_name] = {} # Initialize as empty dict for the new/edited form
+                        data_for_current_form = current_parent_data_slice[attr_name]
+                    else:
+                        # This case implies editing an existing non-dict, non-None value as if it were a new model, which is problematic.
+                        # Or, is_new is False but data is missing. Should be caught by earlier checks.
+                        st.error(f"Error: Trying to edit non-existent or non-dict data for '{attr_name}' without 'is_new' flag or data was None initially.")
+                        valid_path = False
+                        break
+                else: # Intermediate path, create empty dict to continue traversal
+                    current_parent_data_slice[attr_name] = {}
+                    current_parent_data_slice = current_parent_data_slice[attr_name]
+            
+            elif not isinstance(current_parent_data_slice[attr_name], dict):
+                # Attribute exists but is not a dictionary (e.g., a primitive, list, etc.)
+                if is_target_attribute: # This is the one we want to edit
+                    # This is an issue: trying to edit a non-dict as a nested model.
+                    # However, is_single_object check in InputUI should prevent pushing such context.
+                    # If we are here, it implies a logic flaw or schema mismatch.
+                    st.error(f"Data structure error: '{attr_name}' is not a dictionary but is being edited as a nested model. Value: {current_parent_data_slice[attr_name]}")
+                    valid_path = False
+                    break
+                else: # Intermediate path has non-dict value where dict was expected
+                    st.error(f"Data structure error: Intermediate path '{attr_name}' is not a dictionary. Cannot navigate further.")
+                    valid_path = False
+                    break
+            else:
+                # Attribute exists and is a dictionary
+                if is_target_attribute:
+                    data_for_current_form = current_parent_data_slice[attr_name]
+                else:
+                    current_parent_data_slice = current_parent_data_slice[attr_name]
+        
+        if not valid_path:
+            # This handles errors like non-dict in path, or trying to edit non-existent without is_new
+            if not top_context["is_new"] or (data_for_current_form is None and not top_context["is_new"]):
+                 st.error(f"Could not load or initialize data for the nested form: {'.'.join(path_to_current_model_in_root_session_data)}. Returning to previous level.")
+                 editing_stack.pop()
+                 st.rerun()
+                 return st.session_state[root_model_session_data_key]
+
+    # Use a consistent key for the streamlit `st.form` itself, possibly based on current_input_ui_key
+    # This ensures that clear_on_submit applies to the correct form view.
+    streamlit_form_key = f"{current_input_ui_key}-streamlit-form-wrapper"
+
+    with st.form(key=streamlit_form_key, clear_on_submit=clear_on_submit if not is_sub_form else False): # clear_on_submit for root form only
+        ui_instance = InputUI(
+            key=current_input_ui_key, 
+            model=current_model_to_render_class, 
             group_optional_fields=group_optional_fields,
             lowercase_labels=lowercase_labels,
             ignore_empty_values=ignore_empty_values,
-            return_model=True,
-        ).render_ui()
+            return_model=False, # InputUI.render_ui will return dict, pydantic_form handles model validation
+            _editing_stack_key=editing_stack_session_key, 
+            _current_instance_data=data_for_current_form,
+            _is_sub_form=is_sub_form,
+            render_nested_buttons=False # pydantic_form should not render nested buttons
+        )
+        
+        # This call renders the UI fields and updates st.session_state[current_input_ui_key + "-data"]
+        ui_instance.render_ui() 
+        
+        # Submit button for the current form (root or nested)
+        # For sub-forms, this acts as "Save and Close"
+        form_submit_label = "Save and Close" if is_sub_form else submit_label
+        submitted = st.form_submit_button(label=form_submit_label)
 
-        if st.form_submit_button(label=submit_label):
-            return input_state  # type: ignore
-    return None
+        if submitted:
+            current_form_output_data_dict = st.session_state[current_input_ui_key + "-data"]
+            try:
+                # Validate the data from the current form against its model class
+                validated_instance = current_model_to_render_class.model_validate(current_form_output_data_dict)
+                
+                if is_sub_form:
+                    # Save nested form's data back to the parent in the root session state
+                    data_to_update_in_root = st.session_state[root_model_session_data_key]
+                    ptr = data_to_update_in_root
+                    for i, part_key in enumerate(path_to_current_model_in_root_session_data):
+                        if i == len(path_to_current_model_in_root_session_data) - 1:
+                            ptr[part_key] = validated_instance.model_dump()
+                        else:
+                            if not isinstance(ptr.get(part_key), dict): 
+                                ptr[part_key] = {} # Ensure path exists
+                            ptr = ptr[part_key]
+                    
+                    # Clean up the session state for the sub-form that was just submitted
+                    if (current_input_ui_key + "-data") in st.session_state:
+                        del st.session_state[current_input_ui_key + "-data"]
+
+                    editing_stack.pop() 
+                    st.rerun() 
+                    return None # Indicates submission processed, page will reload
+                else:
+                    # This was the root form submission
+                    if clear_on_submit: # Clear root form's data from session
+                         st.session_state[root_model_session_data_key] = model().model_dump()
+
+                    return validated_instance 
+            
+            except ValidationError as ex:
+                # InputUI render_ui itself might show warnings if its return_model was true.
+                # Here, we ensure errors for the final submission are also shown.
+                error_text = "**Input failed validation:**"
+                for error in ex.errors():
+                    location = ".".join(str(loc) for loc in error["loc"]) if "loc" in error else "Field"
+                    error_text += f"\\n\\n**{location}:** {error['msg']}"
+                st.warning(error_text) # Use warning to be consistent with InputUI
+                return None 
+        
+        # "Cancel" button for nested forms (rendered outside st.form_submit_button logic)
+        if is_sub_form:
+            # Place it beside the submit button if possible, or just below.
+            # st.form_submit_button is special, other buttons might not align well within st.form if not careful.
+            # For simplicity, render it directly. It won't submit the form, just navigate.
+            # This button should ideally be outside the `with st.form` or handled carefully.
+            # Let's put a separate cancel button outside the submit logic but within the form scope for layout.
+            # However, a button inside st.form usually triggers form submission.
+            # A common pattern is to use st.columns for side-by-side buttons for submit/cancel.
+            pass # Let's see how submit button works first. A separate cancel button outside form might be cleaner.
+
+    # Cancel button for sub-forms (placed outside the main form block for independent action)
+    if is_sub_form:
+        if st.button("❌ Cancel and Discard Changes", key=f"{current_input_ui_key}-external-cancel"):
+            # Clean up the session state for the sub-form
+            if (current_input_ui_key + "-data") in st.session_state:
+                del st.session_state[current_input_ui_key + "-data"]
+            editing_stack.pop()
+            st.rerun()
+            return None # To satisfy Optional[T] return
+
+    return None # No submission or navigated away
+
+
+def pydantic_nested_input(
+    key: str,
+    model: Type[T],
+    group_optional_fields: GroupOptionalFieldsStrategy = "no",
+    lowercase_labels: bool = False,
+    ignore_empty_values: bool = False,
+) -> Dict[str, Any]:
+    """Auto-generates a Streamlit UI for a Pydantic model, supporting deeply nested editing.
+
+    This function does NOT use a top-level st.form, allowing for custom button handling
+    for navigation within nested models.
+
+    Args:
+        key (str): A unique key for this input group. Used for session state management.
+        model (Type[BaseModel]): The root Pydantic model class.
+        group_optional_fields (str, optional): Strategy for grouping optional fields.
+        lowercase_labels (bool): If True, all labels are lowercased.
+        ignore_empty_values (bool): If True, empty strings/numbers are not stored.
+
+    Returns:
+        Dict[str, Any]: The current state of the root model's data as a dictionary.
+    """
+    editing_stack_session_key = f"{key}-pydantic-editing-stack"
+    if editing_stack_session_key not in st.session_state:
+        st.session_state[editing_stack_session_key] = []
+    
+    editing_stack: List[Dict[str, Any]] = st.session_state[editing_stack_session_key]
+
+    current_model_to_render_class: Type[BaseModel] = model
+    # current_input_ui_key is the key for InputUI instance for the *current* view (root or nested)
+    current_input_ui_key = key 
+    # data_for_current_form is the specific dict slice for the *current* view
+    data_for_current_form: Optional[Dict] = None 
+    
+    path_to_current_model_in_root_session_data: List[str] = [] 
+    is_sub_view = bool(editing_stack)
+
+    # root_model_session_data_key is the key for the *entire* data of the root model instance
+    root_model_session_data_key = key + "-root-data"
+    if root_model_session_data_key not in st.session_state:
+        st.session_state[root_model_session_data_key] = {}
+
+    if is_sub_view:
+        top_context = editing_stack[-1]
+        current_model_to_render_class = top_context["nested_model_class"]
+        
+        temp_path_keys_for_key = [ctx["property_attribute_name"] for ctx in editing_stack]
+        unique_path_str_for_key = "_".join(temp_path_keys_for_key)
+        current_input_ui_key = f"{key}-nested-edit-{unique_path_str_for_key}-{len(editing_stack)}"
+        
+        current_parent_data_slice = st.session_state[root_model_session_data_key]
+        valid_path = True
+        for i_ctx, ctx_item in enumerate(editing_stack):
+            attr_name = ctx_item["property_attribute_name"]
+            path_to_current_model_in_root_session_data.append(attr_name)
+            
+            is_target_attribute = (i_ctx == len(editing_stack) - 1)
+
+            if not isinstance(current_parent_data_slice, dict):
+                st.error(f"Data structure error: Expected a dictionary at path leading to '{attr_name}'. Found: {type(current_parent_data_slice)}")
+                valid_path = False
+                break
+
+            if attr_name not in current_parent_data_slice or current_parent_data_slice[attr_name] is None:
+                # Attribute doesn't exist or is None
+                if is_target_attribute: # This is the one we want to edit/create
+                    if top_context["is_new"] or current_parent_data_slice.get(attr_name) is None:
+                        current_parent_data_slice[attr_name] = {} # Initialize as empty dict for the new/edited form
+                        data_for_current_form = current_parent_data_slice[attr_name]
+                    else:
+                        # This case implies editing an existing non-dict, non-None value as if it were a new model, which is problematic.
+                        # Or, is_new is False but data is missing. Should be caught by earlier checks.
+                        st.error(f"Error: Trying to edit non-existent or non-dict data for '{attr_name}' without 'is_new' flag or data was None initially.")
+                        valid_path = False
+                        break
+                else: # Intermediate path, create empty dict to continue traversal
+                    current_parent_data_slice[attr_name] = {}
+                    current_parent_data_slice = current_parent_data_slice[attr_name]
+            
+            elif not isinstance(current_parent_data_slice[attr_name], dict):
+                # Attribute exists but is not a dictionary (e.g., a primitive, list, etc.)
+                if is_target_attribute: # This is the one we want to edit
+                    # This is an issue: trying to edit a non-dict as a nested model.
+                    # However, is_single_object check in InputUI should prevent pushing such context.
+                    # If we are here, it implies a logic flaw or schema mismatch.
+                    st.error(f"Data structure error: '{attr_name}' is not a dictionary but is being edited as a nested model. Value: {current_parent_data_slice[attr_name]}")
+                    valid_path = False
+                    break
+                else: # Intermediate path has non-dict value where dict was expected
+                    st.error(f"Data structure error: Intermediate path '{attr_name}' is not a dictionary. Cannot navigate further.")
+                    valid_path = False
+                    break
+            else:
+                # Attribute exists and is a dictionary
+                if is_target_attribute:
+                    data_for_current_form = current_parent_data_slice[attr_name]
+                else:
+                    current_parent_data_slice = current_parent_data_slice[attr_name]
+        
+        if not valid_path:
+            # This handles errors like non-dict in path, or trying to edit non-existent without is_new
+            if not top_context["is_new"] or (data_for_current_form is None and not top_context["is_new"]):
+                 st.error(f"Could not load or initialize data for the nested form: {'.'.join(path_to_current_model_in_root_session_data)}. Returning to previous level.")
+                 editing_stack.pop()
+                 st.rerun()
+                 return st.session_state[root_model_session_data_key]
+    else:
+        # This is the root view
+        data_for_current_form = st.session_state[root_model_session_data_key]
+        #current_input_ui_key = key + "-root-data"
+
+    # InputUI will manage its own data in st.session_state under current_input_ui_key + "-data"
+    # Ensure this specific key is initialized if InputUI doesn't create it early enough or needs it.
+    # The _current_instance_data in InputUI now handles populating this.
+
+    ui_instance = InputUI(
+        key=current_input_ui_key, 
+        model=current_model_to_render_class, 
+            group_optional_fields=group_optional_fields,
+            lowercase_labels=lowercase_labels,
+            ignore_empty_values=ignore_empty_values,
+        return_model=False, 
+        _editing_stack_key=editing_stack_session_key,
+        _current_instance_data=data_for_current_form,
+        _is_sub_form=is_sub_view, # To inform InputUI it's part of a nested flow if needed
+        render_nested_buttons=True # Critical: enable Create/Edit/Remove buttons
+    )
+    
+    # This renders the fields. Data is updated in st.session_state[current_input_ui_key + "-data"]
+    ui_instance.render_ui()
+
+    if is_sub_view:
+        cols = st.columns(2)
+        with cols[0]:
+            if st.button("💾 Save Changes", key=f"{current_input_ui_key}-save-nested"):
+                current_form_output_data_dict = st.session_state.get(current_input_ui_key + "-data", {})
+                try:
+                    validated_instance = current_model_to_render_class.model_validate(current_form_output_data_dict)
+                    
+                    data_to_update_in_root = st.session_state[root_model_session_data_key]
+                    ptr = data_to_update_in_root
+                    for i, part_key in enumerate(path_to_current_model_in_root_session_data):
+                        if i == len(path_to_current_model_in_root_session_data) - 1:
+                            ptr[part_key] = validated_instance.model_dump()
+                        else:
+                            if not isinstance(ptr.get(part_key), dict) or ptr[part_key] is None:
+                                ptr[part_key] = {} 
+                            ptr = ptr[part_key]
+                    
+                    # Clean up session state for the sub-view specific InputUI instance
+                    if (current_input_ui_key + "-data") in st.session_state:
+                        del st.session_state[current_input_ui_key + "-data"]
+
+                    editing_stack.pop() 
+                    st.rerun() 
+                
+                except ValidationError as ex:
+                    error_text = "**Input failed validation:**"
+                    for error in ex.errors():
+                        location = ".".join(str(loc) for loc in error["loc"]) if "loc" in error else "Field"
+                        error_text += f"\\n\\n**{location}:** {error['msg']}"
+                    st.warning(error_text)
+        with cols[1]:
+            if st.button("❌ Cancel & Discard", key=f"{current_input_ui_key}-cancel-nested"):
+                # Clean up session state for the sub-view specific InputUI instance
+                if (current_input_ui_key + "-data") in st.session_state:
+                    del st.session_state[current_input_ui_key + "-data"]
+                editing_stack.pop()
+                st.rerun()
+
+    return st.session_state[root_model_session_data_key]
