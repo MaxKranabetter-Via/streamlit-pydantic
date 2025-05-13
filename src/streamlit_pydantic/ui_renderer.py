@@ -1713,10 +1713,13 @@ def pydantic_nested_input(
         
         current_parent_data_slice = st.session_state[root_model_session_data_key]
         valid_path = True
+        # Clear path_to_current_model_in_root_session_data before rebuilding
+        path_to_current_model_in_root_session_data.clear() 
+
         for i_ctx, ctx_item in enumerate(editing_stack):
             attr_name = ctx_item["property_attribute_name"]
             path_to_current_model_in_root_session_data.append(attr_name)
-            
+
             is_target_attribute = (i_ctx == len(editing_stack) - 1)
 
             if not isinstance(current_parent_data_slice, dict):
@@ -1725,57 +1728,55 @@ def pydantic_nested_input(
                 break
 
             if attr_name not in current_parent_data_slice or current_parent_data_slice[attr_name] is None:
-                # Attribute doesn't exist or is None
-                if is_target_attribute: # This is the one we want to edit/create
+                if is_target_attribute:
                     if top_context["is_new"] or current_parent_data_slice.get(attr_name) is None:
-                        current_parent_data_slice[attr_name] = {} # Initialize as empty dict for the new/edited form
+                        current_parent_data_slice[attr_name] = {} 
                         data_for_current_form = current_parent_data_slice[attr_name]
                     else:
-                        # This case implies editing an existing non-dict, non-None value as if it were a new model, which is problematic.
-                        # Or, is_new is False but data is missing. Should be caught by earlier checks.
                         st.error(f"Error: Trying to edit non-existent or non-dict data for '{attr_name}' without 'is_new' flag or data was None initially.")
                         valid_path = False
                         break
-                else: # Intermediate path, create empty dict to continue traversal
+                else: 
                     current_parent_data_slice[attr_name] = {}
                     current_parent_data_slice = current_parent_data_slice[attr_name]
-            
             elif not isinstance(current_parent_data_slice[attr_name], dict):
-                # Attribute exists but is not a dictionary (e.g., a primitive, list, etc.)
-                if is_target_attribute: # This is the one we want to edit
-                    # This is an issue: trying to edit a non-dict as a nested model.
-                    # However, is_single_object check in InputUI should prevent pushing such context.
-                    # If we are here, it implies a logic flaw or schema mismatch.
+                if is_target_attribute:
                     st.error(f"Data structure error: '{attr_name}' is not a dictionary but is being edited as a nested model. Value: {current_parent_data_slice[attr_name]}")
                     valid_path = False
                     break
-                else: # Intermediate path has non-dict value where dict was expected
+                else: 
                     st.error(f"Data structure error: Intermediate path '{attr_name}' is not a dictionary. Cannot navigate further.")
                     valid_path = False
                     break
             else:
-                # Attribute exists and is a dictionary
                 if is_target_attribute:
                     data_for_current_form = current_parent_data_slice[attr_name]
                 else:
                     current_parent_data_slice = current_parent_data_slice[attr_name]
         
         if not valid_path:
-            # This handles errors like non-dict in path, or trying to edit non-existent without is_new
-            if not top_context["is_new"] or (data_for_current_form is None and not top_context["is_new"]):
-                 st.error(f"Could not load or initialize data for the nested form: {'.'.join(path_to_current_model_in_root_session_data)}. Returning to previous level.")
-                 editing_stack.pop()
-                 st.rerun()
-                 return st.session_state[root_model_session_data_key]
+            # This error handling block is for issues during path traversal for a sub_view
+            st.error(f"Could not load or initialize data for the nested form: {'.'.join(path_to_current_model_in_root_session_data)}. Returning to previous level.")
+            editing_stack.pop()
+            st.rerun()
+            return st.session_state[root_model_session_data_key] # Should not be reached
+        
+        # If valid_path is True, we can proceed to display the sub_view UI
+        if top_context["is_new"] and data_for_current_form is None:
+             # This case might be redundant if data_for_current_form is already {} from above logic
+            data_for_current_form = {} 
+        
+        # Display breadcrumbs or navigation path FOR SUB-VIEWS
+        nav_path_display = "Editing: " + model.__name__ + " -> " + " -> ".join(path_to_current_model_in_root_session_data)
+        st.caption(nav_path_display)
+
     else:
-        # This is the root view
+        # This is the ROOT VIEW logic
         data_for_current_form = st.session_state[root_model_session_data_key]
-        #current_input_ui_key = key + "-root-data"
+        current_input_ui_key = key + "-root-ui" 
+        # No navigation path caption for the root view
 
-    # InputUI will manage its own data in st.session_state under current_input_ui_key + "-data"
-    # Ensure this specific key is initialized if InputUI doesn't create it early enough or needs it.
-    # The _current_instance_data in InputUI now handles populating this.
-
+    # Common UI rendering logic starts here
     ui_instance = InputUI(
         key=current_input_ui_key, 
         model=current_model_to_render_class, 
@@ -1830,5 +1831,8 @@ def pydantic_nested_input(
                     del st.session_state[current_input_ui_key + "-data"]
                 editing_stack.pop()
                 st.rerun()
+
+    nav_path_display = "Editing: " + model.__name__ + " -> " + " -> ".join(path_to_current_model_in_root_session_data)
+    st.caption(nav_path_display) # This displays the path for sub-views
 
     return st.session_state[root_model_session_data_key]
