@@ -143,7 +143,7 @@ class InputUI:
             self._render_form_for_model(
                 model_class=self.root_model_class,
                 data_access_path="", 
-                is_editing_mode=False
+                is_nested_model=False
             )
             if self.st.button("Submit Root Form", key=f"{self.key}-submit-root"):
                 try:
@@ -169,7 +169,7 @@ class InputUI:
             self._render_form_for_model(
                 model_class=model_class_to_edit,
                 data_access_path=temp_data_id, 
-                is_editing_mode=True
+                is_nested_model=True
             )
 
             cols = self.st.columns(2)
@@ -197,7 +197,7 @@ class InputUI:
             return None
 
 
-    def _render_form_for_model(self, model_class: Type[BaseModel], data_access_path: str, is_editing_mode: bool):
+    def _render_form_for_model(self, model_class: Type[BaseModel], data_access_path: str, is_nested_model: bool):
         schema = self._get_model_schema(model_class)
         properties = schema.get("properties", {})
 
@@ -226,7 +226,7 @@ class InputUI:
 
             nested_model_class = self._is_field_pydantic_model(field_info)
 
-            field_path_in_main_data = f"{data_access_path}.{actual_attr_name}" if not is_editing_mode and data_access_path else actual_attr_name
+            field_path_in_main_data = f"{data_access_path}.{actual_attr_name}" if not is_nested_model and data_access_path else actual_attr_name
 
             if nested_model_class and self.split_nested_models:
                 self._render_nested_model_controls(
@@ -235,17 +235,17 @@ class InputUI:
                     property_schema=prop_schema_value,
                     parent_model_class=model_class,
                     parent_data_access_path=data_access_path, 
-                    is_parent_editing_mode=is_editing_mode,
+                    is_parent_editing_mode=is_nested_model,
                     nested_model_class=nested_model_class
                 )
             else:
                 current_value: Any
-                if is_editing_mode:
+                if is_nested_model:
                     current_value = self._get_temp_editing_value(data_access_path, actual_attr_name)
                 else:
                     current_value = self._get_main_data_value(field_path_in_main_data)
                 
-                unique_key_for_renderer_call = f"{self.key}_{'edit' if is_editing_mode else 'main'}_{data_access_path}_{actual_attr_name}"
+                unique_key_for_renderer_call = f"{self.key}_{'edit' if is_nested_model else 'main'}_{data_access_path}_{actual_attr_name}"
 
                 returned_value: Any
                 current_model_schema_defs = schema.get('$defs', {})
@@ -267,7 +267,7 @@ class InputUI:
                     )
                 
                 if current_value != returned_value:
-                    if is_editing_mode:
+                    if is_nested_model:
                         self._store_temp_editing_value(data_access_path, actual_attr_name, returned_value)
                     else:
                         self._store_main_data_value(field_path_in_main_data, returned_value)
