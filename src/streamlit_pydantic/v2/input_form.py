@@ -1,6 +1,6 @@
 import inspect
-from typing import Any, Optional, Type, Union, get_args, get_origin
-from pydantic import BaseModel, TypeAdapter
+from typing import Any, Dict, List, Optional, Type, Union, get_args, get_origin
+from pydantic import BaseModel, ValidationError
 from pydantic.fields import FieldInfo
 import streamlit as st
 
@@ -10,167 +10,338 @@ from streamlit_pydantic.v2.utils import _name_to_title, is_single_object
 
 class InputUI:
 
-    def __init__(self, key: str, model: BaseModel, streamlit_container: Any = st):
+    def __init__(self, key: str, model: Type[BaseModel], streamlit_container: Any = st):
         self.key = key
-        self.model = model
+        self.root_model_class = model
         self.st = streamlit_container
         self.split_nested_models = True
 
-        self._load_session(model)
-
-    def _load_session(self, model: BaseModel):
         self._session_state = st.session_state
-        if "run_id" not in st.session_state:
+        if "run_id" not in self._session_state:
             self._session_state.run_id = 0
-        self._session_input_key = self.key + "-data"
-        if self._session_input_key not in st.session_state:
-            self._session_state[self._session_input_key] = {}
 
-        self._editing_stack_session_key = f"{self.key}-pydantic-editing-stack" # stack used to track nested editing contexts (we open and close editing contexts when creating and editing nested models)
+        self._session_main_data_key = f"{self.key}-main-data"
+        if self._session_main_data_key not in self._session_state:
+            try:
+                self._session_state[self._session_main_data_key] = self.root_model_class().model_dump(by_alias=True)
+            except Exception:
+                self._session_state[self._session_main_data_key] = {}
+
+        self._editing_stack_session_key = f"{self.key}-pydantic-editing-stack"
         if self._editing_stack_session_key not in self._session_state:
             self._session_state[self._editing_stack_session_key] = []
 
-        self._type_adapter = None
-        self._input_schema = model.model_json_schema(by_alias=True)
-        self._input_class = model
+        self._session_temp_editing_data_key = f"{self.key}-temp-editing-data"
+        if self._session_temp_editing_data_key not in self._session_state:
+            self._session_state[self._session_temp_editing_data_key] = {}
+        
+        self._schema_cache = {}
 
-        self._schema_properties = self._input_schema.get("properties", {})
-        self._schema_references = self._input_schema.get("$defs", {})
-        self._schema_required = self._input_schema.get("required", [])
+        root_schema = self._get_model_schema(self.root_model_class)
+        self.renderer = StreamlitRenderer(
+            run_id=self._session_state.run_id,
+            key=self.key, 
+            schema_references=root_schema.get("$defs", {})
+        )
 
-        self.renderer = StreamlitRenderer(run_id=self._session_state.run_id, key=self.key, schema_references=self._schema_references)
+    def _get_model_schema(self, model_class: Type[BaseModel]) -> dict:
+        if model_class not in self._schema_cache:
+            self._schema_cache[model_class] = model_class.model_json_schema(by_alias=True)
+        return self._schema_cache[model_class]
 
-    def render_ui(self):
-        for property_key in self._schema_properties.keys():
-            self.render_property(property_key)
-
-    def render_property(self, property_key: str):
-        # data_dict = self._get_value(property_key) is not None or self._get_value(property_key) == {}
-        # data_list = self._get_value(property_key) is not None or self._get_value(property_key) == []
-        property_schema = self._schema_properties[property_key]
-
-        if not property_schema.get("title"):
-            # Set property key as fallback title
-            property_schema["title"] = _name_to_title(property_key)
-
-        if is_single_object(property_schema, self._schema_references):
-            value = self.render_pydantic_property(property_key, property_schema, self._input_class)
-        else:
-            value = self.renderer.render_property(self.st, property_key, property_schema, data=self._get_value(property_key))
-
-    def render_pydantic_property(self,
-                                 property_key: str,
-                                 property_schema: dict[str, Any],
-                                 parent_model_class: Type[BaseModel]):
-        target_field_info: Optional[FieldInfo] = None
-        target_attr_name: Optional[str] = None
-
-        # Find Pydantic FieldInfo: key is from schema (potentially alias)
-        # Parent_model_class.model_fields is keyed by attribute name.
-        for attr_name_iter, field_info_iter in parent_model_class.model_fields.items():
-            if field_info_iter.alias == property_key:
-                target_field_info = field_info_iter
-                target_attr_name = attr_name_iter
-                break
-            # Fallback if alias not used in schema key for some reason (should not happen with by_alias=True)
-            if not target_field_info and attr_name_iter == property_key: # Check if key is already the attribute name
-                    target_field_info = field_info_iter
-                    target_attr_name = attr_name_iter
-
-        if not target_field_info and property_key in parent_model_class.model_fields: # Final check if key is attr_name
-            target_attr_name = property_key
-            target_field_info = parent_model_class.model_fields[property_key]
-
-
-        nested_model_class: Optional[Type[BaseModel]] = None
-        if target_field_info:
-            actual_type = target_field_info.annotation
-            origin_type = get_origin(actual_type)
-
-            types_to_check = []
-            if origin_type is Union or str(origin_type) == "typing.Optional" or str(origin_type) == "Optional": # Optional is Union[X, None]
-                args = get_args(actual_type)
-                types_to_check.extend([t for t in args if t is not type(None)])
-            elif actual_type is not type(None):
-                types_to_check.append(actual_type)
-
-            for t in types_to_check:
-                if inspect.isclass(t) and issubclass(t, BaseModel):
-                    nested_model_class = t
-                    break
-
-        current_value = self._get_value(property_key) # Get current data for the nested model field
-
-        if nested_model_class and target_attr_name:
-            # We have a recognized nested BaseModel field.
-            # Conditionally render buttons or inline form.
-            if self.split_nested_models:
-                field_title = property_schema.get("title", property_key)
-                cols = self.st.columns([3,1,1,1]) if current_value is not None and (property_key not in self._schema_required) else self.st.columns([3,1,1])
-                with cols[0]:
-                    st.markdown(f"**{field_title}**")
-                    if current_value is not None:
-                        st.json(current_value, expanded=False)
-                    elif property_key not in self._schema_required:
-                        st.caption("Optional field, not set.")
-                    else:
-                        st.caption("Required field, not set.")
-
-                button_key_base = f"{self.key}-{self._session_state.run_id}-{target_attr_name}"
-
-                if current_value is None:
-                    if cols[1].button("➕ Create", key=f"{button_key_base}-create", help=f"Create {field_title}"):
-                        #TODO: push editing context
-                        pass
-                else:
-                    if cols[1].button("✏️ Edit", key=f"{button_key_base}-edit", help=f"Edit {field_title}"):
-                        #TODO: push editing context
-                        pass
-
-                if current_value is not None and (property_key not in self._schema_required):
-                    remove_button_col_idx = 2
-                    if cols[remove_button_col_idx].button("➖ Remove", key=f"{button_key_base}-remove", help=f"Remove {field_title}"):
-                        self._store_value(property_key, None)
-                        st.rerun()
-                return current_value # Buttons handle navigation
+    def _get_value_from_state(self, state_dict: dict, key: str) -> Any:
+        current = state_dict
+        if not key:
+            return current
+        for part in key.split("."):
+            if isinstance(current, dict) and part in current:
+                current = current[part]
             else:
-                # Fallback for pydantic_form: render inline (original behavior)
-                return self.renderer.render_single_object_input(self.st, property_key, property_schema)
+                return None 
+        return current
 
-        else: # Not a recognized nested BaseModel or type extraction failed, fallback
-            # Fallback to original rendering for objects if type inspection fails
-            return self.renderer.render_single_object_input(self.st, property_key, property_schema)
-
-    def _get_value_from_state(self, state: dict, key: str) -> Any:
-        key_elements = key.split(".")
-        for i, key_element in enumerate(key_elements):
-            if i == len(key_elements) - 1:
-                # add value to this element
-                if key_element not in state:
-                    return None
-                return state[key_element]
-            if key_element not in state:
-                state[key_element] = {}
-            state = state[key_element]
-        return None
+    def _store_value_in_state(self, state_dict: dict, key: str, value: Any) -> None:
+        parts = key.split(".")
+        current = state_dict
+        for i, part in enumerate(parts):
+            if i == len(parts) - 1:
+                current[part] = value
+            else:
+                if part not in current or not isinstance(current[part], dict):
+                    current[part] = {}
+                current = current[part]
     
-    def _store_value_in_state(self, state: dict, key: str, value: Any) -> None:
-        key_elements = key.split(".")
-        for i, key_element in enumerate(key_elements):
-            if i == len(key_elements) - 1:
-                # add value to this element
-                state[key_element] = value
+    def _delete_value_in_state(self, state_dict: dict, key: str) -> None:
+        parts = key.split(".")
+        current = state_dict
+        for i, part in enumerate(parts):
+            if i == len(parts) - 1:
+                if isinstance(current, dict) and part in current:
+                    del current[part]
                 return
-            if key_element not in state:
-                state[key_element] = {}
-            state = state[key_element]
+            else:
+                if not isinstance(current, dict) or part not in current:
+                    return 
+                current = current[part]
 
-    def _store_value(self, key: str, value: Any) -> None:
-        return self._store_value_in_state(
-            self._session_state[self._session_input_key], key, value
-        )
+    def _get_main_data_value(self, key: str) -> Any:
+        return self._get_value_from_state(self._session_state[self._session_main_data_key], key)
 
-    def _get_value(self, key: str) -> Any:
-        return self._get_value_from_state(
-            self._session_state[self._session_input_key], key
-        )
+    def _store_main_data_value(self, key: str, value: Any) -> None:
+        self._store_value_in_state(self._session_state[self._session_main_data_key], key, value)
+
+    def _get_temp_editing_value(self, temp_data_id: str, sub_key: str) -> Any:
+        if temp_data_id not in self._session_state[self._session_temp_editing_data_key]:
+            self._session_state[self._session_temp_editing_data_key][temp_data_id] = {}
+        return self._get_value_from_state(self._session_state[self._session_temp_editing_data_key][temp_data_id], sub_key)
+
+    def _store_temp_editing_value(self, temp_data_id: str, sub_key: str, value: Any) -> None:
+        if temp_data_id not in self._session_state[self._session_temp_editing_data_key]:
+            self._session_state[self._session_temp_editing_data_key][temp_data_id] = {}
+        self._store_value_in_state(self._session_state[self._session_temp_editing_data_key][temp_data_id], sub_key, value)
+    
+    def _clear_temp_editing_data(self, temp_data_id: str) -> None:
+        if temp_data_id in self._session_state[self._session_temp_editing_data_key]:
+            del self._session_state[self._session_temp_editing_data_key][temp_data_id]
+
+    def _is_field_pydantic_model(self, field_info: FieldInfo) -> Optional[Type[BaseModel]]:
+        actual_type = field_info.annotation
+        
+        candidate_types = [] 
+
+        origin = get_origin(actual_type)
+        if origin is Union: # Handles Union and Optional (e.g. Union[T, NoneType])
+            for arg_type in get_args(actual_type):
+                # We are interested in concrete types from the Union that could be BaseModels
+                if arg_type is not type(None) and inspect.isclass(arg_type): # Ensure arg_type is a class and not NoneType
+                    candidate_types.append(arg_type)
+        elif actual_type is not type(None) and inspect.isclass(actual_type): # Ensure actual_type is a class and not NoneType
+            # Not a Union, but a direct class type (e.g., MyModel, int, str)
+            candidate_types.append(actual_type)
+        # Otherwise (e.g., it's a generic like List[int], or Any, or ForwardRef)
+        # candidate_types will be empty.
+
+        for candidate_cls in candidate_types:
+            # At this point, candidate_cls is confirmed by inspect.isclass() and is not NoneType.
+            try:
+                if issubclass(candidate_cls, BaseModel): # No need for inspect.isclass(candidate_cls) again here
+                    return candidate_cls
+            except TypeError:
+                # This handles the reported error: if issubclass() itself fails
+                # because candidate_cls is not considered a "class" by its strict standards,
+                # despite inspect.isclass() being true for it.
+                # We simply skip this candidate, treating it as not a BaseModel subclass.
+                pass 
+        
+        return None
+
+    def render_ui(self) -> Optional[BaseModel]:
+        editing_stack: List[Dict[str, Any]] = self._session_state[self._editing_stack_session_key]
+
+        if not editing_stack:
+            self.st.subheader(f"Configure {self.root_model_class.__name__}") 
+            self._render_form_for_model(
+                model_class=self.root_model_class,
+                data_access_path="", 
+                is_editing_mode=False
+            )
+            if self.st.button("Submit Root Form", key=f"{self.key}-submit-root"):
+                try:
+                    current_data = self._get_main_data_value("")
+                    if current_data is None: current_data = {}
+                    validated_data = self.root_model_class(**current_data)
+                    self.st.success("Root form submitted successfully!")
+                    self.st.json(validated_data.model_dump(by_alias=True))
+                    return validated_data
+                except ValidationError as e:
+                    self.st.error(f"Validation Error: {e}")
+                except Exception as ex:
+                    self.st.error(f"Error submitting root form: {ex}")
+
+            return None 
+        else:
+            current_edit_context = editing_stack[-1]
+            model_class_to_edit = current_edit_context["model_class"]
+            temp_data_id = current_edit_context["temp_data_id"]
+            form_title = current_edit_context["title"]
+            
+            self.st.subheader(form_title)
+            self._render_form_for_model(
+                model_class=model_class_to_edit,
+                data_access_path=temp_data_id, 
+                is_editing_mode=True
+            )
+
+            cols = self.st.columns(2)
+            if cols[0].button("💾 Save", key=f"{self.key}-save-{temp_data_id}"):
+                try:
+                    current_temp_data = self._session_state[self._session_temp_editing_data_key].get(temp_data_id, {})
+                    validated_instance = model_class_to_edit(**current_temp_data)
+                    
+                    save_to_path_in_main_data = current_edit_context["save_to_path"]
+                    self._store_main_data_value(save_to_path_in_main_data, validated_instance.model_dump(by_alias=True))
+                    
+                    self._clear_temp_editing_data(temp_data_id)
+                    editing_stack.pop()
+                    self.st.rerun()
+                except ValidationError as e:
+                    self.st.error(f"Validation Error: {e}")
+                except Exception as e:
+                    self.st.error(f"An unexpected error occurred on save: {e}")
+
+
+            if cols[1].button("❌ Cancel", key=f"{self.key}-cancel-{temp_data_id}"):
+                self._clear_temp_editing_data(temp_data_id)
+                editing_stack.pop()
+                self.st.rerun()
+            return None
+
+
+    def _render_form_for_model(self, model_class: Type[BaseModel], data_access_path: str, is_editing_mode: bool):
+        schema = self._get_model_schema(model_class)
+        properties = schema.get("properties", {})
+
+        for prop_schema_key, prop_schema_value in properties.items():
+            field_info = None
+            actual_attr_name = prop_schema_key 
+            
+            for attr_name_iter, field_info_iter in model_class.model_fields.items():
+                if field_info_iter.alias == prop_schema_key:
+                    field_info = field_info_iter
+                    actual_attr_name = attr_name_iter
+                    break
+                if not field_info and attr_name_iter == prop_schema_key: 
+                    field_info = field_info_iter
+                    actual_attr_name = attr_name_iter
+            
+            if not field_info and prop_schema_key in model_class.model_fields:
+                actual_attr_name = prop_schema_key
+                field_info = model_class.model_fields[prop_schema_key]
+
+            if not field_info:
+                continue
+
+            if not prop_schema_value.get("title"):
+                prop_schema_value["title"] = _name_to_title(actual_attr_name)
+
+            nested_model_class = self._is_field_pydantic_model(field_info)
+
+            field_path_in_main_data = f"{data_access_path}.{actual_attr_name}" if not is_editing_mode and data_access_path else actual_attr_name
+
+            if nested_model_class and self.split_nested_models:
+                self._render_nested_model_controls(
+                    property_key_in_schema=prop_schema_key,
+                    property_attr_name=actual_attr_name,
+                    property_schema=prop_schema_value,
+                    parent_model_class=model_class,
+                    parent_data_access_path=data_access_path, 
+                    is_parent_editing_mode=is_editing_mode,
+                    nested_model_class=nested_model_class
+                )
+            else:
+                current_value: Any
+                if is_editing_mode:
+                    current_value = self._get_temp_editing_value(data_access_path, actual_attr_name)
+                else:
+                    current_value = self._get_main_data_value(field_path_in_main_data)
+                
+                unique_key_for_renderer_call = f"{self.key}_{'edit' if is_editing_mode else 'main'}_{data_access_path}_{actual_attr_name}"
+
+                returned_value: Any
+                current_model_schema_defs = schema.get('$defs', {})
+                if is_single_object(prop_schema_value, current_model_schema_defs) and not nested_model_class:
+                    if unique_key_for_renderer_call not in st.session_state or st.session_state[unique_key_for_renderer_call] is None:
+                         st.session_state[unique_key_for_renderer_call] = current_value
+
+                    returned_value = self.renderer.render_single_object_input(
+                        self.st,
+                        unique_key_for_renderer_call, 
+                        prop_schema_value
+                    )
+                else:
+                    returned_value = self.renderer.render_property(
+                        self.st, 
+                        unique_key_for_renderer_call, 
+                        prop_schema_value, 
+                        current_value
+                    )
+                
+                if current_value != returned_value:
+                    if is_editing_mode:
+                        self._store_temp_editing_value(data_access_path, actual_attr_name, returned_value)
+                    else:
+                        self._store_main_data_value(field_path_in_main_data, returned_value)
+                        st.rerun()
+                                
+    def _render_nested_model_controls(self, property_key_in_schema: str, property_attr_name: str, property_schema: dict,
+                                      parent_model_class: Type[BaseModel], parent_data_access_path: str,
+                                      is_parent_editing_mode: bool, nested_model_class: Type[BaseModel]):
+        
+        field_title = property_schema.get("title", _name_to_title(property_attr_name))
+        editing_stack: List[Dict[str, Any]] = self._session_state[self._editing_stack_session_key]
+        
+        path_in_main_data_for_nested_model: str
+        if is_parent_editing_mode:
+            parent_context = next((item for item in reversed(editing_stack) if item["temp_data_id"] == parent_data_access_path), None)
+            if not parent_context:
+                self.st.error(f"Internal error: Parent editing context not found for {parent_data_access_path}")
+                return
+            parent_save_path = parent_context['save_to_path']
+            path_in_main_data_for_nested_model = f"{parent_save_path}.{property_attr_name}" if parent_save_path else property_attr_name
+        else:
+            path_in_main_data_for_nested_model = f"{parent_data_access_path}.{property_attr_name}" if parent_data_access_path else property_attr_name
+
+        current_value_in_main_data = self._get_main_data_value(path_in_main_data_for_nested_model)
+        
+        parent_schema = self._get_model_schema(parent_model_class)
+        is_required_in_parent = property_key_in_schema in parent_schema.get("required", [])
+
+        cols_spec = [3,1,1,1] if current_value_in_main_data is not None and not is_required_in_parent else [3,1,1]
+        cols = self.st.columns(cols_spec)
+
+        with cols[0]:
+            self.st.markdown(f"**{field_title}**")
+            if current_value_in_main_data is not None:
+                self.st.json(current_value_in_main_data, expanded=False)
+            elif not is_required_in_parent:
+                self.st.caption("Optional field, not set.")
+            else:
+                self.st.caption("Required field, not set.")
+
+        button_key_base = f"{self.key}-{self._session_state.run_id}-nestedctl-{parent_data_access_path}-{property_attr_name}"
+
+        if current_value_in_main_data is None:
+            if cols[1].button("➕ Create", key=f"{button_key_base}-create", help=f"Create {field_title}"):
+                temp_data_id = f"temp_{property_attr_name}_{len(editing_stack)}_{self._session_state.run_id}"
+                try:
+                    initial_data = nested_model_class().model_dump(by_alias=True)
+                except Exception: 
+                    initial_data = {}
+                self._session_state[self._session_temp_editing_data_key][temp_data_id] = initial_data
+                
+                editing_stack.append({
+                    "model_class": nested_model_class,
+                    "temp_data_id": temp_data_id,
+                    "save_to_path": path_in_main_data_for_nested_model, 
+                    "title": f"Create {field_title}"
+                })
+                self.st.rerun()
+        else:
+            if cols[1].button("✏️ Edit", key=f"{button_key_base}-edit", help=f"Edit {field_title}"):
+                temp_data_id = f"temp_{property_attr_name}_{len(editing_stack)}_{self._session_state.run_id}"
+                import copy
+                self._session_state[self._session_temp_editing_data_key][temp_data_id] = copy.deepcopy(current_value_in_main_data)
+                
+                editing_stack.append({
+                    "model_class": nested_model_class,
+                    "temp_data_id": temp_data_id,
+                    "save_to_path": path_in_main_data_for_nested_model,
+                    "title": f"Edit {field_title}"
+                })
+                self.st.rerun()
+
+        if current_value_in_main_data is not None and not is_required_in_parent:
+            remove_button_col_idx = 2
+            if cols[remove_button_col_idx].button("➖ Remove", key=f"{button_key_base}-remove", help=f"Remove {field_title}"):
+                self._store_main_data_value(path_in_main_data_for_nested_model, None) 
+                self.st.rerun()
