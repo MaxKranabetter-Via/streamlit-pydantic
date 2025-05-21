@@ -3,7 +3,9 @@ from typing import Any, Dict, List, Optional, Type, Union, get_args, get_origin
 from pydantic import BaseModel, ValidationError
 from pydantic.fields import FieldInfo
 import streamlit as st
+import copy
 
+from streamlit_pydantic import schema_utils
 from streamlit_pydantic.v2.ui_renderer_v2 import StreamlitRenderer
 from streamlit_pydantic.v2.utils import _name_to_title, is_single_object
 
@@ -155,6 +157,23 @@ class InputUI:
         
         return None
 
+    def _get_dict_value_model_class(self, field_info: FieldInfo) -> Optional[Type[BaseModel]]:
+        """Checks if a dictionary field's values are Pydantic models."""
+        # field_info.annotation should be something like Dict[KeyType, ValueType]
+        origin_type = get_origin(field_info.annotation)
+        if origin_type is dict:
+            args = get_args(field_info.annotation)
+            if len(args) == 2:
+                value_type = args[1]
+                # Value type could be a Union (e.g., Optional[MyModel])
+                if get_origin(value_type) is Union:
+                    for union_arg in get_args(value_type):
+                        if inspect.isclass(union_arg) and issubclass(union_arg, BaseModel):
+                            return union_arg
+                elif inspect.isclass(value_type) and issubclass(value_type, BaseModel):
+                    return value_type
+        return None
+
     def render_ui(self) -> Optional[BaseModel]:
         editing_stack: List[Dict[str, Any]] = self._session_state[self._editing_stack_session_key]
 
@@ -245,10 +264,21 @@ class InputUI:
                 prop_schema_value["title"] = _name_to_title(actual_attr_name)
 
             nested_model_class = self._is_field_pydantic_model(field_info)
+            dict_value_model_class = self._get_dict_value_model_class(field_info)
 
             field_path_in_main_data = f"{data_access_path}.{actual_attr_name}" if not is_nested_model and data_access_path else actual_attr_name
 
-            if nested_model_class and self.split_nested_models:
+            if dict_value_model_class and schema_utils.is_single_dict_property(prop_schema_value) and self.split_nested_models:
+                self._render_dictionary_with_model_values(
+                    property_schema_key=prop_schema_key,
+                    property_attr_name=actual_attr_name,
+                    dict_property_schema=prop_schema_value,
+                    value_model_class=dict_value_model_class,
+                    parent_model_class=model_class,
+                    parent_data_access_path=data_access_path,
+                    is_parent_editing_mode=is_nested_model
+                )
+            elif nested_model_class and self.split_nested_models:
                 self._render_nested_model_controls(
                     property_key_in_schema=prop_schema_key,
                     property_attr_name=actual_attr_name,
@@ -276,14 +306,15 @@ class InputUI:
                     returned_value = self.renderer.render_single_object_input(
                         self.st,
                         unique_key_for_renderer_call, 
-                        prop_schema_value
+                        prop_schema_value,
+                        data=current_value
                     )
                 else:
                     returned_value = self.renderer.render_property(
                         self.st, 
                         unique_key_for_renderer_call, 
                         prop_schema_value, 
-                        current_value
+                        data=current_value
                     )
                 
                 if current_value != returned_value:
@@ -291,7 +322,7 @@ class InputUI:
                         self._store_temp_editing_value(data_access_path, actual_attr_name, returned_value)
                     else:
                         self._store_main_data_value(field_path_in_main_data, returned_value)
-                        st.rerun()
+                    st.rerun()
                                 
     def _render_nested_model_controls(self, property_key_in_schema: str, property_attr_name: str, property_schema: dict,
                                       parent_model_class: Type[BaseModel], parent_data_access_path: str,
@@ -365,3 +396,166 @@ class InputUI:
             if cols[remove_button_col_idx].button("➖ Remove", key=f"{button_key_base}-remove", help=f"Remove {field_title}"):
                 self._store_main_data_value(path_in_main_data_for_nested_model, None) 
                 self.st.rerun()
+
+    def _render_dictionary_with_model_values(
+        self,
+        property_schema_key: str,
+        property_attr_name: str,
+        dict_property_schema: dict,
+        value_model_class: Type[BaseModel],
+        parent_model_class: Type[BaseModel],
+        parent_data_access_path: str,
+        is_parent_editing_mode: bool
+    ):
+        dict_title = dict_property_schema.get("title", _name_to_title(property_attr_name))
+        editing_stack: List[Dict[str, Any]] = self._session_state[self._editing_stack_session_key]
+
+        current_dict_data: Optional[dict]
+        path_to_dict_in_main_store: str
+
+        if is_parent_editing_mode:
+            current_dict_data = self._get_temp_editing_value(parent_data_access_path, property_attr_name)
+
+            parent_context = next((item for item in reversed(editing_stack) if item["temp_data_id"] == parent_data_access_path), None)
+            if not parent_context:
+                self.st.error(f"Internal error: Parent editing context not found for {parent_data_access_path} while rendering dict '{property_attr_name}'.")
+                return
+            parent_save_path = parent_context['save_to_path']
+            path_to_dict_in_main_store = f"{parent_save_path}.{property_attr_name}" if parent_save_path else property_attr_name
+        else:
+            path_to_dict_in_main_store = f"{parent_data_access_path}.{property_attr_name}" if parent_data_access_path else property_attr_name
+            current_dict_data = self._get_main_data_value(path_to_dict_in_main_store)
+
+        if current_dict_data is None:
+            current_dict_data = dict_property_schema.get("default", {})
+            if is_parent_editing_mode:
+                self._store_temp_editing_value(parent_data_access_path, property_attr_name, current_dict_data)
+            else:
+                self._store_main_data_value(path_to_dict_in_main_store, current_dict_data)
+
+
+        self.st.subheader(dict_title)
+        if dict_property_schema.get("description"):
+            self.st.markdown(dict_property_schema.get("description"))
+
+        btn_cols = self.st.columns(2)
+        action_on_dict = False
+
+        dict_controls_key_base = f"{self.key}-dictctl-{parent_data_access_path}-{property_attr_name}"
+
+        if btn_cols[0].button("➕ Add New Item to Dictionary", key=f"{dict_controls_key_base}-add", use_container_width=True):
+            new_key_base = "new_key"
+            new_key_suffix = 1
+            candidate_new_key = f"{new_key_base}_{new_key_suffix}"
+            while candidate_new_key in current_dict_data:
+                new_key_suffix += 1
+                candidate_new_key = f"{new_key_base}_{new_key_suffix}"
+            current_dict_data[candidate_new_key] = None
+            action_on_dict = True
+            
+        if btn_cols[1].button("Clear All Items", key=f"{dict_controls_key_base}-clear", use_container_width=True):
+            current_dict_data.clear()
+            action_on_dict = True
+
+        if action_on_dict:
+            if is_parent_editing_mode:
+                self._store_temp_editing_value(parent_data_access_path, property_attr_name, current_dict_data)
+            else:
+                self._store_main_data_value(path_to_dict_in_main_store, current_dict_data)
+            self.st.rerun()
+
+        if not current_dict_data:
+            self.st.caption("Dictionary is empty.")
+        
+        items_to_process = list(current_dict_data.items())
+        
+        for item_idx, (item_key, item_value) in enumerate(items_to_process):
+            item_container = self.st.container()
+            with item_container:
+                item_key_base = f"{dict_controls_key_base}-item{item_idx}"
+                
+                new_item_key = item_key
+                
+                key_col, val_col, remove_item_col = item_container.columns([2,3,1])
+
+                with key_col:
+                    new_item_key = self.st.text_input(
+                        "Key", 
+                        value=item_key, 
+                        key=f"{item_key_base}-keytext",
+                    )
+
+                key_changed = False
+                if new_item_key != item_key:
+                    if new_item_key in current_dict_data and new_item_key != item_key :
+                        key_col.error(f"Key '{new_item_key}' already exists. Choose a unique key.")
+                    else:
+                        current_dict_data.pop(item_key)
+                        current_dict_data[new_item_key] = item_value 
+                        item_key = new_item_key
+                        key_changed = True
+
+
+                with val_col:
+                    self.st.markdown(f"**Value for '{item_key}'** (`{value_model_class.__name__}`)")
+                    
+                    path_for_this_item_value_in_main_store = f"{path_to_dict_in_main_store}.{item_key}"
+                    
+                    if item_value is not None:
+                        try:
+                            self.st.json(item_value, expanded=False)
+                        except:
+                            self.st.text(str(item_value))
+                    else:
+                        self.st.caption("Value not set (None).")
+
+                    val_action_cols = self.st.columns(3 if item_value is not None else 2)
+                    value_action_taken = False
+
+                    if item_value is None:
+                        if val_action_cols[0].button("➕ Create Value", key=f"{item_key_base}-createval", use_container_width=True):
+                            temp_data_id = f"temp_val_{property_attr_name}_{item_key}_{len(editing_stack)}_{self._session_state.run_id}"
+                            try:
+                                initial_data = value_model_class().model_dump(by_alias=True)
+                            except Exception:
+                                initial_data = {}
+                            self._session_state[self._session_temp_editing_data_key][temp_data_id] = initial_data
+                            editing_stack.append({
+                                "model_class": value_model_class,
+                                "temp_data_id": temp_data_id,
+                                "save_to_path": path_for_this_item_value_in_main_store,
+                                "title": f"Create value for '{item_key}' in '{dict_title}'"
+                            })
+                            value_action_taken = True
+                    else:
+                        if val_action_cols[0].button("✏️ Edit Value", key=f"{item_key_base}-editval", use_container_width=True):
+                            temp_data_id = f"temp_val_{property_attr_name}_{item_key}_{len(editing_stack)}_{self._session_state.run_id}"
+                            self._session_state[self._session_temp_editing_data_key][temp_data_id] = copy.deepcopy(item_value)
+                            editing_stack.append({
+                                "model_class": value_model_class,
+                                "temp_data_id": temp_data_id,
+                                "save_to_path": path_for_this_item_value_in_main_store,
+                                "title": f"Edit value for '{item_key}' in '{dict_title}'"
+                            })
+                            value_action_taken = True
+                        
+                        if val_action_cols[1].button("🗑️ Clear Value", key=f"{item_key_base}-clearval", help="Set this value to None", use_container_width=True):
+                            current_dict_data[item_key] = None
+                            value_action_taken = True
+
+
+                item_removed_from_dict = False
+                with remove_item_col:
+                    self.st.markdown("## ")
+                    if self.st.button("❌ Remove Item", key=f"{item_key_base}-removeitem", help=f"Remove entry for key '{item_key}'", use_container_width=True):
+                        current_dict_data.pop(item_key)
+                        item_removed_from_dict = True
+                
+                self.st.markdown("---")
+
+                if key_changed or value_action_taken or item_removed_from_dict:
+                    if is_parent_editing_mode:
+                        self._store_temp_editing_value(parent_data_access_path, property_attr_name, current_dict_data)
+                    else:
+                        self._store_main_data_value(path_to_dict_in_main_store, current_dict_data)
+                    self.st.rerun()
