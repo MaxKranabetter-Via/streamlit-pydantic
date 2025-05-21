@@ -391,17 +391,18 @@ class StreamlitRenderer(StreamlitBase):
                     )
 
                 with value_col:
-                    new_property = {
+                    value_property_schema = {
                         "title": "Value",
-                        "init_value": dict_value,
                         "is_item": True,
                         "readOnly": property.get("readOnly"),
                         **property["additionalProperties"],
                     }
-                    with value_col:
-                        updated_value = self.render_property(
-                            streamlit_app, dict_value_key, new_property
-                        )
+                    updated_value = self.render_property(
+                        streamlit_app, 
+                        dict_value_key, 
+                        value_property_schema, 
+                        data=dict_value 
+                    )
 
                     return updated_key, updated_value
 
