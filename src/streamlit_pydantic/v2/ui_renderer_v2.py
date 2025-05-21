@@ -286,8 +286,7 @@ class StreamlitRenderer(StreamlitBase):
             new_property["readOnly"] = property.get("readOnly", False)
 
             value = self.render_property(streamlit_app, full_key, new_property)
-            if not self._is_value_ignored(property_key, value):
-                object_inputs[property_key] = value
+            object_inputs[property_key] = value
 
         return object_inputs
 

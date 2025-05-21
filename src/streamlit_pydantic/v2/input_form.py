@@ -10,7 +10,7 @@ from streamlit_pydantic.v2.utils import _name_to_title, is_single_object
 
 class InputUI:
 
-    def __init__(self, key: str, model: Type[BaseModel], streamlit_container: Any = st):
+    def __init__(self, key: str, model: Type[BaseModel], streamlit_container: Any = st, initial_data_object: Optional[BaseModel] = None):
         self.key = key
         self.root_model_class = model
         self.st = streamlit_container
@@ -22,10 +22,30 @@ class InputUI:
 
         self._session_main_data_key = f"{self.key}-main-data"
         if self._session_main_data_key not in self._session_state:
-            try:
-                self._session_state[self._session_main_data_key] = self.root_model_class().model_dump(by_alias=True)
-            except Exception:
-                self._session_state[self._session_main_data_key] = {}
+            if initial_data_object is not None:
+                if isinstance(initial_data_object, self.root_model_class):
+                    try:
+                        self._session_state[self._session_main_data_key] = initial_data_object.model_dump(by_alias=True)
+                        self.st.info(f"Form '{key}' pre-loaded with data from the provided object.")
+                    except Exception as e:
+                        self.st.error(f"Error dumping provided initial_data_object for form '{key}': {e}. Initializing with empty data.")
+                        self._session_state[self._session_main_data_key] = {}
+                else:
+                    self.st.warning(
+                        f"The provided initial_data_object for form '{key}' is not an instance of "
+                        f"{self.root_model_class.__name__}. Initializing with default data for {self.root_model_class.__name__}."
+                    )
+                    # Fallback to default model initialization
+                    try:
+                        self._session_state[self._session_main_data_key] = self.root_model_class().model_dump(by_alias=True)
+                    except Exception:
+                        self._session_state[self._session_main_data_key] = {}
+            else:
+                # No initial_data_object provided, use default initialization
+                try:
+                    self._session_state[self._session_main_data_key] = self.root_model_class().model_dump(by_alias=True)
+                except Exception:
+                    self._session_state[self._session_main_data_key] = {}
 
         self._editing_stack_session_key = f"{self.key}-pydantic-editing-stack"
         if self._editing_stack_session_key not in self._session_state:
